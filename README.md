@@ -1,102 +1,136 @@
-# Project 21: Simplified Log Replication System Architecture
+# Project 21: Simplified Log Replication System
 
-## 1. System Overview
+This project implements a compact RAFT-style replicated log. A single leader accepts client writes, stores entries in SQLite, replicates them to followers, commits after a majority acknowledgement, applies committed entries to a deterministic in-memory state machine, and elects a new leader after fail-stop crashes.
 
-A distributed log replication cluster implementing RAFT consensus. A single leader serializes client writes, replicates entries to followers, and commits entries after receiving majority (n/2 + 1) acknowledgment. Automatic leader election handles node failures under a fail-stop model. Each node runs in an isolated Docker container simulating multiple servers within docker-compose. SQLite handles persistent storage. An in-memory state machine and metrics collector use `sync.Mutex` for thread-safe concurrent access.
+## Architecture
 
----
+Each node is the same Go binary and contains:
 
-## 2. Component Architecture
+| Component | Responsibility | Implementation |
+| --- | --- | --- |
+| Replication engine | Owns RAFT role transitions, client writes, AppendEntries, commit advancement, backfill, and state-machine application. | Single event loop with channels from gRPC handlers. |
+| Election manager | Tracks `currentTerm`, `votedFor`, randomized election timeout, RequestVote RPCs, and leader transitions. | Persisted term/vote in SQLite before replies. |
+| Log store | Stores log entries and persistent metadata. | SQLite with WAL and `synchronous=FULL`. |
+| State machine | Deterministically applies committed commands. | Mutex-protected `map[string]string`. Supports `SET key value` and `DEL key`; unknown commands are stored as `entry/<index>`. |
+| gRPC/protobuf layer | Inter-node RAFT RPCs and client API. | `RequestVote`, `AppendEntries`, `SubmitEntry`, `QueryLog`, `GetMetrics`. |
+| Metrics collector | Records submit, commit, and apply timestamps. | Mutex-protected timestamp maps exposed through `GetMetrics`. |
 
-| Component | Responsibility | Exact Tech Mapping |
-|-----------|----------------|-------------------|
-| **ReplicationEngine** | Coordinates log replication, commit logic, and client request handling. Drives the single-goroutine RAFT event loop. | Go struct with channels for RPC events. `time.Ticker` for heartbeats. Sequential state machine calls. |
-| **ElectionManager** | Handles term tracking, vote requests, vote responses, and leader election transitions. | Go struct with randomized timeout logic. Persists `currentTerm` and `votedFor` to SQLite. |
-| **Log** | Stores and retrieves RAFT log entries. Provides append, lookup, and truncate operations. | SQLite-backed store via `database/sql`. `PRAGMA journal_mode=WAL`. `PRAGMA synchronous=FULL`. |
-| **StateMachine** | Applies committed log entries deterministically. Guarantees replicated state convergence. | `map[string]string` protected by `sync.Mutex`. Sequential apply loop invoked by ReplicationEngine. |
-| **gRPC/Protobuf Layer** | Handles inter-node RPCs (`RequestVote`, `AppendEntries`) and client APIs (`SubmitEntry`, `QueryLog`, `GetMetrics`). | `protoc` generates Go structs. `grpc-go` implements server and client. Strict protobuf message schemas. |
-| **Metrics Collector** | Records submission, commit, and apply timestamps. Calculates replication lag and apply delay. | Struct with `map[int64]time.Time` and `map[int64]time.Duration`. Protected by `sync.Mutex`. |
+## Repository Layout
 
----
-
-## 2.1 Node Internal Module Structure
-
-Each container runs one RAFT node instance. The instance contains four modules that interact through Go channels and mutex-protected data structures:
-
-- **Log Module**: Persists log entries to SQLite. Provides `Append(term, command)`, `Get(index)`, and `Truncate(fromIndex)` operations. Flushes to disk before acknowledging writes.
-- **StateMachine Module**: Applies committed entries to an in-memory `map[string]string`. Protected by `sync.Mutex`. Updated sequentially by the ReplicationEngine after majority commit.
-- **ReplicationEngine Module**: Accepts client writes, broadcasts `AppendEntries` RPCs, tracks `nextIndex[]` and `matchIndex[]`, and advances `commitIndex` on majority ACK. Invokes StateMachine apply and Metrics updates.
-- **ElectionManager Module**: Manages election timeouts, sends `RequestVote` RPCs, processes vote responses, and updates `currentTerm` and `votedFor`. Persists voting state to SQLite before responding to RPCs.
-
-Module interaction flow:
-```
-Client Request
-     |
-     V
-ReplicationEngine --> Log (append entry)
-     |
-     V
-ReplicationEngine --> ElectionManager (check term validity)
-     |
-     V
-ReplicationEngine --> gRPC Layer (broadcast AppendEntries)
-     |
-     V
-Majority ACK received
-     |
-     V
-ReplicationEngine --> StateMachine (apply committed entry)
-     |
-     V
-ReplicationEngine --> Metrics Collector (record timestamps)
-     |
-     V
-Respond to Client
+```text
+cmd/node/              RAFT node server
+cmd/client/            CLI for submit/query/metrics/compare/validate
+internal/raft/         RAFT logic, SQLite store, state machine, metrics
+internal/pb/           Committed protobuf-compatible Go stubs
+proto/raft.proto       RPC and message schema
+docker-compose.yml     Three-node local cluster
+scripts/validate.*     End-to-end validation helpers
 ```
 
----
+The protobuf-compatible Go files are committed so normal builds do not require `protoc`. If `proto/raft.proto` changes, regenerate or update `internal/pb`.
 
-## 3. Data Flow & Consistency Model
+## Quick Start
 
-```
-Client --[Submit]--> Leader --[Append to SQLite]--> Broadcast AppendEntries --> Followers
-                          |                                   ^
-                          V                                   |
-                  Majority ACK? --Yes--> Update commitIndex ──┘
-                          |
-                          V
-                  Apply to State Machine --> Respond to Client
+With Docker:
+
+```sh
+docker compose up -d --build node1 node2 node3
+docker compose run --rm client validate --nodes "node1:50051,node2:50051,node3:50051"
 ```
 
-- **Strong Consistency:** All writes route through the leader. Entries commit only after majority replication. Reads query the leader. Followers serve reads only after applying `commitIndex`.
-- **Log Matching:** `prevLogIndex` and `prevLogTerm` checks guarantee identical history across nodes. Candidates require up-to-date logs to win elections.
-- **Crash Recovery:** Node startup loads `currentTerm`, `votedFor`, and full log from SQLite. Volatile tracking (`nextIndex[]`, `matchIndex[]`) resets to defaults. Leader detects mismatches and backfills missing entries through `AppendEntries` retries.
+From the host after the cluster is running:
 
----
+```sh
+go run ./cmd/client submit --nodes localhost:5001,localhost:5002,localhost:5003 --command "SET color blue"
+go run ./cmd/client compare --nodes localhost:5001,localhost:5002,localhost:5003
+go run ./cmd/client metrics --addr localhost:5001
+```
 
-## 4. Deployment Architecture
+Useful Make targets:
 
-The cluster runs three identical containers on a dedicated Docker bridge network. Each container exposes a unique host port mapped to the internal gRPC port. Docker DNS resolves peer addresses using container names. Host directories mount to `/data` inside each container to persist SQLite files. Container stop and start commands simulate fail-stop crashes and recoveries. Peer addresses initialize from environment variables at startup.
+```sh
+make up
+make submit CMD="SET user alice"
+make compare
+make validate
+make crash
+make restart
+make down
+```
 
-Docker compose is not a part of the architecture, and is only used to simplify the testing process. In production conditions, each node should be deployed on a separate server.
+## Validation Checklist
 
----
+### Submit log entries and compare logs across nodes
 
-## 5. Validation Checklist Mapping
+```sh
+docker compose run --rm client submit --nodes "node1:50051,node2:50051,node3:50051" --command "SET x 1"
+docker compose run --rm client compare --nodes "node1:50051,node2:50051,node3:50051"
+```
 
-| Checklist Item | Implementation Steps |
-|----------------|----------------------|
-| **Submit & compare logs** | Client CLI submits entries via gRPC. `QueryLog` RPC returns SQLite contents. Validation script fetches logs from all nodes. Script diffs `(index, term, command)` sequences. Identical sequences confirm correct replication. |
-| **Crash/restart continuity** | Execution stops target container. Execution restarts target container. Node reloads SQLite state. Node rejoins cluster. Leader detects index mismatch and backfills entries. Validation script verifies continuous index sequence and consistent terms. |
-| **Measure delay & lag** | Leader records `t_commit` timestamp after majority ACK. Followers record `t_apply` timestamp after state machine update. Client CLI fetches timestamps via `GetMetrics` RPC. CLI computes `replication_lag = leader.commitIndex - follower.lastApplied`. CLI computes `apply_delay = t_apply - t_commit`. CLI outputs numeric results. |
+`compare` queries each node through `QueryLog` and compares `(index, term, command)` sequences.
 
----
+### Simulate node crash/restart and verify continuity
 
-## 6. Go Implementation
+```sh
+docker compose stop node2
+docker compose run --rm client submit --nodes "node1:50051,node2:50051,node3:50051" --command "SET during_crash yes"
+docker compose start node2
+sleep 4
+docker compose run --rm client compare --nodes "node1:50051,node2:50051,node3:50051"
+```
 
-- **RAFT Goroutine:** One event loop owns all state transitions, timer ticks, and log writes. This design eliminates data races.
-- **Channel Routing:** gRPC handlers send requests to unbuffered channels. RAFT loop consumes requests synchronously.
-- **State Machine:** RAFT loop acquires `sync.Mutex`. Loop applies committed entries to `map[string]string`. Loop releases mutex. Query handlers acquire mutex for safe concurrent reads.
-- **Metrics Collector:** RAFT loop and gRPC handlers update timestamp maps under `sync.Mutex`. `GetMetrics` handler reads data safely and returns JSON output.
-- **SQLite Access:** Single writer per node. `WAL` mode enables concurrent reads. All critical writes (`term`, `votedFor`, `log`) flush to disk before sending RPC responses or client acknowledgments.
-- **Election Liveness:** Election timeout calculation uses `base + rand.Intn(base)`. This calculation prevents split votes and guarantees leader election progress.
+The restarted node reloads `currentTerm`, `votedFor`, `commit_index`, and log entries from SQLite. The leader uses `nextIndex` retries to backfill missing entries.
+
+### Measure log application delay and replication lag
+
+```sh
+docker compose run --rm client validate --nodes "node1:50051,node2:50051,node3:50051" --command "SET metric sample"
+docker compose run --rm client metrics --addr node1:50051
+```
+
+Metrics include:
+
+- `replication_lag = commitIndex - lastApplied`
+- `submitted_at_unix_nano`
+- `committed_at_unix_nano`
+- `applied_at_unix_nano`
+- `apply_delay_nanos`
+
+The `validate` command submits an entry, waits for log convergence, and prints per-node delay from the leader commit timestamp to each node apply timestamp.
+
+## API
+
+`RaftService` exposes:
+
+- `RequestVote(RequestVoteRequest)`: election RPC.
+- `AppendEntries(AppendEntriesRequest)`: heartbeat and log replication RPC.
+- `SubmitEntry(SubmitEntryRequest)`: client write API. Followers reject writes and return the known leader id when available.
+- `QueryLog(QueryLogRequest)`: returns role, term, commit index, applied index, log entries, and state snapshot.
+- `GetMetrics(GetMetricsRequest)`: returns lag and per-entry timing data.
+
+See [proto/raft.proto](proto/raft.proto) for exact message schemas.
+
+## Local Non-Docker Run
+
+Start three terminals:
+
+```sh
+go run ./cmd/node --id node1 --addr :5001 --data ./data/node1 --peers "node1=localhost:5001,node2=localhost:5002,node3=localhost:5003"
+go run ./cmd/node --id node2 --addr :5002 --data ./data/node2 --peers "node1=localhost:5001,node2=localhost:5002,node3=localhost:5003"
+go run ./cmd/node --id node3 --addr :5003 --data ./data/node3 --peers "node1=localhost:5001,node2=localhost:5002,node3=localhost:5003"
+```
+
+Then:
+
+```sh
+go run ./cmd/client validate --nodes localhost:5001,localhost:5002,localhost:5003
+```
+
+## Consistency Notes
+
+- Writes are accepted only by the leader.
+- Entries are committed after a majority acknowledgement.
+- Followers enforce `prevLogIndex` and `prevLogTerm` checks.
+- Candidates must have an up-to-date log to win an election.
+- Committed entries are replayed from SQLite on restart.
+- Leader recovery/backfill uses `nextIndex` decrement and AppendEntries retries.
