@@ -12,7 +12,7 @@ import (
 	"strings"
 	"syscall"
 
-	"project21/internal/pb"
+	pb "project21/internal/pb"
 	"project21/internal/raft"
 
 	"google.golang.org/grpc"

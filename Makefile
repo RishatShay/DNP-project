@@ -1,4 +1,4 @@
-.PHONY: build up down logs submit query compare metrics validate crash restart clean
+.PHONY: build up down logs submit query compare metrics validate crash restart clean proto
 
 NODES ?= node1:50051,node2:50051,node3:50051
 HOST_NODES ?= localhost:5001,localhost:5002,localhost:5003
@@ -39,3 +39,10 @@ restart:
 
 clean:
 	docker compose down -v
+
+proto:
+	rm -f internal/pb/raft.pb.go internal/pb/raft_grpc.pb.go
+	protoc -I proto \
+			--go_out=internal/pb --go_opt=paths=source_relative \
+			--go-grpc_out=internal/pb --go-grpc_opt=paths=source_relative \
+			raft.proto

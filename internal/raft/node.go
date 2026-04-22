@@ -36,6 +36,7 @@ type Config struct {
 }
 
 type Node struct {
+	pb.UnimplementedRaftServiceServer
 	id      string
 	address string
 	peers   map[string]string

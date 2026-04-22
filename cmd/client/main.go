@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"project21/internal/pb"
+	pb "project21/internal/pb"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

@@ -2,10 +2,9 @@ package raft
 
 import (
 	"fmt"
+	"project21/internal/pb"
 	"strings"
 	"sync"
-
-	"project21/internal/pb"
 )
 
 type StateMachine struct {
