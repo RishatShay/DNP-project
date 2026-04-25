@@ -11,7 +11,7 @@ docker-compose up -d --build node1 node2 node3
 sleep 4
 read -p "Nodes started. Press Enter to continue..."
 
-echo -e "\nStep 2: Read logs & verify match"
+echo -e "\nStep 2: Compare logs across nodes"
 docker-compose run --rm client validate --nodes $NODES
 read -p "Logs match. Press Enter..."
 
@@ -20,7 +20,7 @@ docker-compose run --rm client submit --nodes $NODES --command "SET user Alice"
 echo -n "Verify: "; docker-compose run --rm client query --addr node1:50051 --key user
 read -p "Alice saved. Press Enter..."
 
-echo -e "\n📋 Step 4: Kill the leader"
+echo -e "\nStep 4: Simulate leader crash"
 echo "Current Status:"
 docker-compose run --rm client metrics --nodes $NODES 2>/dev/null | head -20
 echo "Open another terminal and kill the leader:"
@@ -31,11 +31,13 @@ echo -e "\nStep 5: Request status (Check leader change)"
 docker-compose run --rm client metrics --nodes $NODES 2>/dev/null | head -20
 read -p "New leader elected. Press Enter..."
 
-echo -e "\nStep 6: Submit more logs (Quorum test)"
+echo -e "\nStep 6: Submit more logs & Measure delay/lag"
 docker-compose run --rm client submit --nodes $NODES --command "SET user Bob"
-read -p "Bob saved. Press Enter..."
+# Explicitly fetch metrics to measure replication lag & application delay
+docker-compose run --rm client metrics --nodes $NODES 2>/dev/null | head -20
+read -p "Metrics recorded. Press Enter..."
 
-echo -e "\nStep 7: Restart dead node & verify follower"
+echo -e "\nStep 7: Restart dead node & verify log continuity"
 echo "Restart the dead node:"
 echo "   docker-compose start <dead_node_name>"
 read -p "Node restarted. Waiting for catch-up..."
